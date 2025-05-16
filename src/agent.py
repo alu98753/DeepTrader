@@ -116,8 +116,12 @@ class RLAgent():
                 = self.actor(x_a, x_m, masks, deterministic=False)
 
             ror = torch.from_numpy(self.env.ror).to(self.args.device)
-            normed_ror = (ror - torch.mean(ror, dim=-1, keepdim=True)) / \
-                         torch.std(ror, dim=-1, keepdim=True)
+            std_ror = torch.std(ror, dim=-1, keepdim=True)
+            normed_ror = (ror - torch.mean(ror, dim=-1, keepdim=True)) / (std_ror + EPS)
+            # （可選）增加檢查，如果 normed_ror 仍然出現 NaN/Inf (EPS 可能不足以處理極端情況)
+            if torch.isnan(normed_ror).any() or torch.isinf(normed_ror).any():
+                self.logger.warning("normed_ror contains NaN/Inf after stable division! Clamping to 0.")
+                normed_ror = torch.nan_to_num(normed_ror, nan=0.0, posinf=0.0, neginf=0.0) 
 
             next_states, rewards, rho_labels, masks, done, info = \
                 self.env.step(weights, rho.detach().cpu().numpy())
@@ -126,8 +130,16 @@ class RLAgent():
             steps_reward_total.append(rewards.total - info['market_avg_return'])
 
             asu_grad = torch.sum(normed_ror * scores_p, dim=-1)
-            steps_asu_grad.append(torch.log(asu_grad))
+            stable_log_input = torch.clamp(asu_grad, min=EPS) # 例如，最小限制為 EPS
+            log_asu_grad = torch.log(stable_log_input)
 
+            if torch.isnan(log_asu_grad).any() or torch.isinf(log_asu_grad).any():
+                self.logger.warning(f"log_asu_grad contains NaN/Inf! Original asu_grad: {asu_grad.tolist()}, Clamped input: {stable_log_input.tolist()}")
+                # 對log後的NaN/Inf進行處理，例如替換為一個大的負數（如果原始值接近0）或0
+                log_asu_grad = torch.nan_to_num(log_asu_grad, nan=-20.0, posinf=0.0, neginf=-20.0) # 示例值
+
+            steps_asu_grad.append(log_asu_grad)
+            
             agent_wealth = np.concatenate((agent_wealth, info['total_value'][..., None]), axis=1)
             states = next_states
 

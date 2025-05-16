@@ -2,7 +2,7 @@
 import numpy as np
 data_prefix = './data/DJIA/'
 
-stocks_data = np.load(data_prefix + 'ROR.npy')
+stocks_data = np.load(data_prefix + 'market_data.npy')
 
 # 在 run.py 載入 stocks_data 之後
 print(f"DEBUG: stocks_data.npy loaded. Shape: {stocks_data.shape}, Dtype: {stocks_data.dtype}")
