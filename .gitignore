@@ -113,3 +113,9 @@ dmypy.json
 # Pyre type checker
 .pyre/
 .DS_Store
+
+# my custom
+*.npy
+*.csv
+*.pkl
+*outputs

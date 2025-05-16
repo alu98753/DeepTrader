@@ -9,39 +9,8 @@ class nconv(nn.Module):
         super(nconv, self).__init__()
 
     def forward(self, x, A):
-        print(f"ASU nconv DEBUG before einsum: x.shape={x.shape}, x.dtype={x.dtype}, x.device={x.device}, x.requires_grad={x.requires_grad}")
-        print(f"ASU nconv DEBUG before einsum: A.shape={A.shape}, A.dtype={A.dtype}, A.device={A.device}, A.requires_grad={A.requires_grad}")
-
-        if torch.isnan(x).any():
-            print("ASU nconv WARNING: Tensor x CONTAINS NaNs before einsum!")
-        if torch.isinf(x).any():
-            print("ASU nconv WARNING: Tensor x CONTAINS infs before einsum!")
-        # 可以在这里打印 x 的一小部分值，例如 x[0,0,0,:10]
-        # print(f"ASU nconv DEBUG x sample: {x[0,0,0,:10]}")
-
-
-        if torch.isnan(A).any():
-            print("ASU nconv WARNING: Tensor A CONTAINS NaNs before einsum!")
-        if torch.isinf(A).any():
-            print("ASU nconv WARNING: Tensor A CONTAINS infs before einsum!")
-
-        # 检查是否有任何维度为0
-        if any(s == 0 for s in x.shape) or any(s == 0 for s in A.shape):
-            print(f"ASU nconv WARNING: Zero dimension found in input tensors! x.shape: {x.shape}, A.shape: {A.shape}")
-
-        try:
-            x_out = torch.einsum('ncvl,vw->ncwl', (x, A)) # 错误发生在这里
-        except RuntimeError as e:
-            print(f"ASU nconv ERROR: torch.einsum on GPU failed! Error: {e}")
-            # (可选) 尝试在CPU上执行以对比
-            print("Attempting einsum on CPU for debugging...")
-            try:
-                x_cpu = torch.einsum('ncvl,vw->ncwl', (x.cpu(), A.cpu()))
-                print(f"ASU nconv DEBUG: einsum on CPU successful. Output shape: {x_cpu.shape}")
-            except Exception as cpu_e:
-                print(f"ASU nconv ERROR: einsum on CPU also failed! Error: {cpu_e}")
-            raise e 
-        return x_out.contiguous() # 确保返回 x_out
+        x = torch.einsum('ncvl,vw->ncwl', (x, A))
+        return x.contiguous()
 
 
 class linear(nn.Module):
@@ -125,8 +94,7 @@ class SAGCN(nn.Module):
 
         self.supports = supports
 
-        self.start_conv = nn.Conv1d(in_features, hidden_dim, kernel_size=(1, 1))
-        # self.start_conv = nn.Conv2d(in_features, hidden_dim, kernel_size=(1,1))
+        self.start_conv = nn.Conv2d(in_features, hidden_dim, kernel_size=(1, 1))
         self.bn_start = nn.BatchNorm2d(hidden_dim)
 
         receptive_field = 1
@@ -148,20 +116,30 @@ class SAGCN(nn.Module):
         a_s_records = []
         dilation = 1
         for l in range(layers):
-            tcn_sequence = nn.Sequential(nn.Conv1d(in_channels=hidden_dim,
-                                                   out_channels=hidden_dim,
-                                                   kernel_size=(1, kernel_size),
-                                                   dilation=dilation),
-                                         nn.ReLU(),
-                                         nn.Dropout(dropout),
-                                         nn.BatchNorm2d(hidden_dim))
+            time_kernel_width = kernel_size # kernel_size 是 SAGCN __init__ 的參數, 例如 hyper.json 中的 2
 
-            self.tcns.append(tcn_sequence)
+            # 時間卷積層 (TCN part)
+            # 輸入 x 的形狀是 (batch, hidden_dim, num_nodes, current_seq_len)
+            # 我們希望對每個節點的特徵序列獨立地在時間維度上進行卷積
+            # kernel_size=(1, time_kernel_width) 表示卷積核高度為1（不跨節點的特徵通道），寬度為 time_kernel_width（時間步）
+            # dilation=(1, dilation) 表示只在時間維度上進行膨脹
+            # padding: 為了使殘差連接 x = x + residual[:, :, :, -x.shape[3]:] 成立，
+            # TCN層的輸出時間維度長度需要與 residual 切片後的長度匹配。
+            # 如果 time_kernel_width = K 和 dilation = D，標準無填充 Conv2d 的輸出長度會減少 D*(K-1)。
+            # 這裡我們不加 padding，讓長度自然減少，殘差連接時會進行匹配。
+            self.tcns.append(nn.Sequential(
+                nn.Conv2d(in_channels=hidden_dim,
+                        out_channels=hidden_dim,
+                        kernel_size=(1, time_kernel_width), # (kernel_height, kernel_width)
+                        dilation=(1, dilation)),           # (dilation_height, dilation_width)
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.BatchNorm2d(hidden_dim) # BatchNorm2d 適用於4D輸入
+            ))
 
-            self.residual_convs.append(nn.Conv1d(in_channels=hidden_dim,
-                                                 out_channels=hidden_dim,
-                                                 kernel_size=(1, 1)))
-
+            self.residual_convs.append(nn.Conv2d(in_channels=hidden_dim,
+                                                out_channels=hidden_dim,
+                                                kernel_size=(1, 1))) # 1x1 Conv2d 用於殘差連接
             self.bns.append(nn.BatchNorm2d(hidden_dim))
 
             if self.gcn_bool:
@@ -280,21 +258,43 @@ class ASU(nn.Module):
                            supports, spatial_bool, addaptiveadj, aptinit)
         self.linear1 = nn.Linear(hidden_dim, 1)
 
-        self.bn1 = nn.BatchNorm1d(num_features=num_nodes)
-        self.in1 = nn.InstanceNorm1d(num_features=num_nodes)
+        # 原來的 bn1 和未使用的層:
+        # self.bn1 = nn.BatchNorm1d(num_features=num_nodes)
+        # self.in1 = nn.InstanceNorm1d(num_features=num_nodes) # 未使用
+        # self.lstm = nn.LSTM(input_size=in_features, hidden_size=hidden_dim, ) # 未使用
 
-        self.lstm = nn.LSTM(input_size=in_features, hidden_size=hidden_dim, )
-        self.hidden_dim = hidden_dim
+        # 修改後 (使用 LayerNorm):
+        self.ln1 = nn.LayerNorm(hidden_dim) # LayerNorm作用在最後一個維度 (hidden_dim)
 
+        self.hidden_dim = hidden_dim # 這個似乎也沒在 ASU 中直接使用，但在 SAGCN 中可能間接相關
+
+# --- 在 ASU 類的 forward 方法中 ---
     def forward(self, inputs, mask):
         """
         inputs: [batch, num_stock, window_len, num_features]
         mask: [batch, num_stock]
         outputs: [batch, scores]
         """
-
-        x = self.bn1(self.sagcn(inputs))
+        x = self.ln1(self.sagcn(inputs)) # 或者 self.bn1，取決於您最終的選擇
         x = self.linear1(x).squeeze(-1)
-        score = 1 / ((-x).exp() + 1)
-        score[mask] = -math.inf
-        return score
+        
+        unmasked_score = torch.sigmoid(x) # Sigmoid 的原始輸出
+
+        if mask is not None:
+            # 使用 torch.where 避免原地修改
+            # masked_score = torch.where(mask, torch.tensor(-math.inf, device=x.device, dtype=x.dtype), unmasked_score)
+            # torch.where 在 PyTorch 2.x 中可能對 -math.inf 的梯度處理有更嚴格的要求，
+            # 一個更安全且對於后续 softmax 更常見的做法是使用一個非常小的數值代替 -inf，
+            # 或者確保 mask 的部分在 softmax 時得到極小概率。
+            # 鑒於 DeepTrader 的邏輯是 topk + softmax，-math.inf 是為了確保不被選中。
+            # 讓我們堅持使用 -math.inf，但用 torch.where。
+            # 需要確保 -math.inf 被正確地轉換為與 unmasked_score 相同的 device 和 dtype。
+            # PyTorch 1.3.1 可能對此更寬容，2.5.1 可能需要更明確。
+            
+            # 創建一個和 unmasked_score 同 device 同 dtype 的 -inf 張量
+            neg_inf_tensor = torch.tensor(-math.inf, device=unmasked_score.device, dtype=unmasked_score.dtype)
+            score_after_mask = torch.where(mask, neg_inf_tensor, unmasked_score)
+        else:
+            score_after_mask = unmasked_score
+            
+        return score_after_mask
