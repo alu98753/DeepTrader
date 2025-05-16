@@ -9,8 +9,39 @@ class nconv(nn.Module):
         super(nconv, self).__init__()
 
     def forward(self, x, A):
-        x = torch.einsum('ncvl,vw->ncwl', (x, A))
-        return x.contiguous()
+        print(f"ASU nconv DEBUG before einsum: x.shape={x.shape}, x.dtype={x.dtype}, x.device={x.device}, x.requires_grad={x.requires_grad}")
+        print(f"ASU nconv DEBUG before einsum: A.shape={A.shape}, A.dtype={A.dtype}, A.device={A.device}, A.requires_grad={A.requires_grad}")
+
+        if torch.isnan(x).any():
+            print("ASU nconv WARNING: Tensor x CONTAINS NaNs before einsum!")
+        if torch.isinf(x).any():
+            print("ASU nconv WARNING: Tensor x CONTAINS infs before einsum!")
+        # 可以在这里打印 x 的一小部分值，例如 x[0,0,0,:10]
+        # print(f"ASU nconv DEBUG x sample: {x[0,0,0,:10]}")
+
+
+        if torch.isnan(A).any():
+            print("ASU nconv WARNING: Tensor A CONTAINS NaNs before einsum!")
+        if torch.isinf(A).any():
+            print("ASU nconv WARNING: Tensor A CONTAINS infs before einsum!")
+
+        # 检查是否有任何维度为0
+        if any(s == 0 for s in x.shape) or any(s == 0 for s in A.shape):
+            print(f"ASU nconv WARNING: Zero dimension found in input tensors! x.shape: {x.shape}, A.shape: {A.shape}")
+
+        try:
+            x_out = torch.einsum('ncvl,vw->ncwl', (x, A)) # 错误发生在这里
+        except RuntimeError as e:
+            print(f"ASU nconv ERROR: torch.einsum on GPU failed! Error: {e}")
+            # (可选) 尝试在CPU上执行以对比
+            print("Attempting einsum on CPU for debugging...")
+            try:
+                x_cpu = torch.einsum('ncvl,vw->ncwl', (x.cpu(), A.cpu()))
+                print(f"ASU nconv DEBUG: einsum on CPU successful. Output shape: {x_cpu.shape}")
+            except Exception as cpu_e:
+                print(f"ASU nconv ERROR: einsum on CPU also failed! Error: {cpu_e}")
+            raise e 
+        return x_out.contiguous() # 确保返回 x_out
 
 
 class linear(nn.Module):
@@ -95,7 +126,7 @@ class SAGCN(nn.Module):
         self.supports = supports
 
         self.start_conv = nn.Conv1d(in_features, hidden_dim, kernel_size=(1, 1))
-
+        # self.start_conv = nn.Conv2d(in_features, hidden_dim, kernel_size=(1,1))
         self.bn_start = nn.BatchNorm2d(hidden_dim)
 
         receptive_field = 1

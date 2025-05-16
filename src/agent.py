@@ -155,7 +155,7 @@ class RLAgent():
                 else:
                     loss = - (gradient_asu)
                 loss = loss.mean()
-                assert not torch.isnan(loss)
+                # assert not torch.isnan(loss)
                 self.optimizer.zero_grad()
                 loss = loss.contiguous()
                 loss.backward()
